@@ -1031,7 +1031,10 @@ input:focus::placeholder, textarea:focus::placeholder { opacity:0.4; }
         <div class="adm-title">แผงควบคุม</div>
         <div class="adm-sub">กำลังแก้ไข: <span id="adm-profile-name" style="color:var(--accent);font-weight:600">ห้องเรียนหลัก</span></div>
       </div>
-      <button class="btn btn-o btn-sm" onclick="doLogout()">ออกจากระบบ</button>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span id="unsaved-flag" style="display:none;align-items:center;gap:5px;font-size:12px;font-weight:700;color:#c92a2a;background:rgba(201,42,42,0.1);border:1px solid rgba(201,42,42,0.3);padding:4px 10px;border-radius:999px">● ยังไม่ได้บันทึก</span>
+        <button class="btn btn-o btn-sm" onclick="doLogout()">ออกจากระบบ</button>
+      </div>
     </div>
 
     <div class="adm-grid">
@@ -1044,6 +1047,19 @@ input:focus::placeholder, textarea:focus::placeholder { opacity:0.4; }
           <button class="ps-share" onclick="copyProfileLink()" title="คัดลอกลิงก์เปิดตรงห้องนี้">🔗 คัดลอกลิงก์ห้องนี้</button>
           <button class="ps-share" onclick="openProfileLink()" title="เปิดหน้าห้องนี้ในแท็บใหม่">↗ เปิดดู</button>
           <button class="ps-new" onclick="doNewProfile()">＋ เพิ่มห้องเรียน</button>
+        </div>
+      </div>
+
+      <!-- Backup / Restore (ทั้งเว็บ ทุกห้องเรียน) -->
+      <div class="ac full">
+        <div class="ac-title">💾 สำรอง / กู้คืนข้อมูล (ทั้งเว็บ ทุกห้องเรียน)</div>
+        <div class="io-bar">
+          <span class="io-label">🗄️ ไฟล์สำรอง .json</span>
+          <button class="btn btn-p btn-sm" onclick="doExportJson()">⬇ สำรองข้อมูลทั้งเว็บ</button>
+          <label class="btn btn-o btn-sm" style="cursor:pointer;margin:0">⬆ กู้คืนจากไฟล์<input type="file" accept=".json,application/json" style="display:none" onchange="doImportJson(event)"></label>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:8px;line-height:1.5">
+          สำรองทุกห้องเรียน · ลิงก์ · ประกาศ · ธีม · โลโก้ · การตั้งค่า GAS/Drive ไว้เป็นไฟล์เดียว แนะนำให้สำรองเป็นประจำ การกู้คืนจะแทนที่ข้อมูลปัจจุบันทั้งหมด
         </div>
       </div>
 
@@ -1285,24 +1301,60 @@ const PRESETS = [
   {label:'เขียวมิดไนต์',  a1:'#1de9b6',a2:'#64ffda',bg:'#0f1a17',tx:'#ddf7f0'},
 ];
 
+// ─── SYNC GUARDS (กันชน race condition) ───
+// adminOpen      = อยู่ในแผงจัดการหรือไม่ (ถ้าใช่ ห้าม snapshot รีเซ็ตฟอร์มที่กำลังแก้)
+// localWriteUntil= กันเสียง echo จากการเขียนของเราเอง (snapshot ที่เด้งกลับมาทันที)
+// configLoaded   = โหลดครั้งแรกเสร็จแล้ว เพื่อให้ปุ่มสลับห้องรอจนพร้อม
+let adminOpen=false, configLoaded=false, localWriteUntil=0, switching=false;
+function markLocalWrite(){ localWriteUntil = Date.now()+4000; }
+// บันทึก store ทั้งก้อนขึ้น Firebase (ใช้ตอนสลับ/สร้าง/ลบห้อง) — กันข้อมูลหายหลังรีเฟรช
+async function persistStore(){
+  try{
+    const {doc,setDoc}=window._firestoreFns;
+    if(!window._db||!doc) return false;
+    markLocalWrite();
+    await setDoc(doc(window._db,'linktree','config'), store);
+    return true;
+  }catch(e){ toast('ซิงก์ไม่สำเร็จ: '+e.message,'err'); return false; }
+}
+
 // ─── FIREBASE INIT ───
 window.addEventListener('firebaseReady', async()=>{
   await loadConfig(); buildPresets(); buildProfileTabs();
+  configLoaded=true;
   gi('loading').classList.add('hidden');
   maybeShowAnnModal();   // เด้งประกาศเมื่อเปิดหน้าเว็บ
   const {doc,onSnapshot}=window._firestoreFns;
-  onSnapshot(doc(window._db,'linktree','config'),snap=>{
-    if(snap.exists()){
-      const d=snap.data();
-      if(d.profiles) store.profiles=d.profiles;
-      if(d.activeProfile) store.activeProfile=d.activeProfile;
-      if(d.password) store.password=d.password;
-      if(d.gasEndpoint!==undefined) store.gasEndpoint=d.gasEndpoint;
-      if(d.driveFolderId!==undefined) store.driveFolderId=d.driveFolderId;
-      syncDriveCfg();
-      renderPublic();
-      if(gi('adm-panel').style.display==='block') renderStats();
+  onSnapshot(doc(window._db,'linktree','config'),{includeMetadataChanges:false},snap=>{
+    if(!snap.exists()) return;
+    // ข้าม echo จากการเขียนของเราเอง / ระหว่างกำลังสลับห้อง
+    if(snap.metadata.hasPendingWrites) return;
+    if(switching || Date.now()<localWriteUntil) return;
+    const d=snap.data();
+    if(d.password) store.password=d.password;
+    if(d.gasEndpoint!==undefined) store.gasEndpoint=d.gasEndpoint;
+    if(d.driveFolderId!==undefined) store.driveFolderId=d.driveFolderId;
+    syncDriveCfg();
+    // ⛔ ถ้ากำลังแก้ไขอยู่ในแผงจัดการ ห้ามทับ profiles/activeProfile (กันฟอร์มเด้ง/ข้อมูลหาย)
+    if(adminOpen){
+      // อัปเดตเฉพาะห้องที่ "ไม่ได้กำลังแก้" เพื่อให้ข้อมูลห้องอื่นสดอยู่ แต่ไม่แตะห้องปัจจุบัน
+      if(d.profiles){
+        Object.keys(d.profiles).forEach(id=>{
+          if(id!==store.activeProfile) store.profiles[id]=d.profiles[id];
+        });
+        // ลบห้องที่ถูกลบจากเครื่องอื่น (ยกเว้นห้องที่กำลังแก้)
+        Object.keys(store.profiles).forEach(id=>{
+          if(id!==store.activeProfile && !d.profiles[id]) delete store.profiles[id];
+        });
+        buildProfileTabs();
+      }
+      renderStats();
+      return;
     }
+    // อยู่หน้าสาธารณะ: รับค่าล่าสุดได้เต็มที่
+    if(d.profiles) store.profiles=d.profiles;
+    if(d.activeProfile) store.activeProfile=d.activeProfile;
+    renderPublic(); buildProfileTabs();
   });
 });
 setTimeout(()=>{
@@ -1344,7 +1396,9 @@ async function doSave(silent=false){
   try{
     collectForm();
     const {doc,setDoc}=window._firestoreFns;
+    markLocalWrite();
     await setDoc(doc(window._db,'linktree','config'), store);
+    markClean();   // บันทึกแล้ว → ไม่มีการแก้ไขค้าง
     renderPublic(); applyTheme(); renderStats();
     if(!silent){
       const b=gi('save-btn'); b.classList.add('flashed'); setTimeout(()=>b.classList.remove('flashed'),900);
@@ -1457,6 +1511,7 @@ async function countClick(idx){
   p.links[idx].clicks=(p.links[idx].clicks||0)+1;
   try{
     const {doc,setDoc}=window._firestoreFns;
+    markLocalWrite();   // กัน snapshot echo มาทับขณะกำลังแก้ในแผงจัดการ
     await setDoc(doc(window._db,'linktree','config'), store, {merge:true});
   }catch(e){ /* ทำงานต่อแม้บันทึกไม่ได้ */ }
 }
@@ -1946,11 +2001,37 @@ async function checkGas(){
   }catch(e){ st.style.color='#c92a2a'; st.textContent='⚠️ เชื่อมต่อ GAS ไม่ได้ — ตรวจ URL และ Deploy (Anyone can access)'; }
 }
 
+// ─── DIRTY STATE (เตือนบันทึกเมื่อมีการแก้ไขค้าง) ───
+let isDirty=false;
+function markDirty(){
+  if(!adminOpen) return;          // นับเฉพาะตอนอยู่ในแผงจัดการ
+  if(switching) return;           // การสลับห้องไม่ถือเป็นการแก้ที่ผู้ใช้พิมพ์
+  isDirty=true;
+  const b=gi('unsaved-flag'); if(b) b.style.display='inline-flex';
+}
+function markClean(){
+  isDirty=false;
+  const b=gi('unsaved-flag'); if(b) b.style.display='none';
+}
+// ถามยืนยันก่อนทิ้งการแก้ไข — คืน true ถ้าออกได้
+function confirmDiscard(){
+  if(!isDirty) return true;
+  return confirm('⚠️ มีการแก้ไขที่ยังไม่ได้บันทึก\n\nหากออกตอนนี้ การเปลี่ยนแปลงจะหายไป\n\nกด "ตกลง" เพื่อออกโดยไม่บันทึก  •  กด "ยกเลิก" เพื่อกลับไปบันทึกก่อน');
+}
+// ติดตามการพิมพ์/เปลี่ยนค่าในแผงจัดการ → ตั้งสถานะ dirty
+document.addEventListener('input', e=>{ if(adminOpen && e.target.closest && e.target.closest('#adm-panel')) markDirty(); });
+document.addEventListener('change', e=>{ if(adminOpen && e.target.closest && e.target.closest('#adm-panel')) markDirty(); });
+// เตือนเมื่อปิด/รีโหลดแท็บเบราว์เซอร์ทั้ง ๆ ที่ยังไม่บันทึก
+window.addEventListener('beforeunload', e=>{
+  if(adminOpen && isDirty){ e.preventDefault(); e.returnValue=''; return ''; }
+});
+
 // ─── AUTH ───
 function doPw(){
   const pw=gi('adm-pw').value;
   if(pw===store.password||pw==='1234'){
     gi('lock-wrap').style.display='none'; gi('adm-panel').style.display='block'; gi('pw-err').style.display='none';
+    adminOpen=true; markClean();
     buildProfileTabs(); fillForm(); renderLinks(); renderAnns(); renderStats();
   } else {
     gi('pw-err').style.display='block';
@@ -1959,6 +2040,8 @@ function doPw(){
   }
 }
 function doLogout(){
+  if(!confirmDiscard()) return;     // เตือนบันทึกก่อนออกจากแผงจัดการ
+  adminOpen=false; markClean();
   gi('lock-wrap').style.display='flex'; gi('adm-panel').style.display='none';
   gi('adm-pw').value=''; gi('pw-err').style.display='none';
   switchTab('public',document.querySelector('.t-btn'));
@@ -1966,6 +2049,12 @@ function doLogout(){
 
 // ─── TABS ───
 function switchTab(tab,btn){
+  // ออกจากหน้าจัดการไปหน้าสาธารณะทั้งที่ยังไม่บันทึก → เตือนก่อน
+  if(tab==='public' && adminOpen && isDirty && gi('adm-panel') && gi('adm-panel').style.display==='block'){
+    if(!confirmDiscard()) return;
+    adminOpen=false; markClean();
+    gi('lock-wrap').style.display='flex'; gi('adm-panel').style.display='none';
+  }
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.t-btn').forEach(b=>b.classList.remove('active'));
   gi('page-'+tab).classList.add('active');
@@ -2289,10 +2378,70 @@ function doImportXlsx(e){
       }
       if(imported===0){ toast('ไม่พบข้อมูลในไฟล์','err'); return; }
       fillForm(); renderLinks(); renderAnns(); renderPublic(); applyTheme(); buildProfileTabs(); renderStats();
-      toast(`Import สำเร็จ! (${imported} ชีท)`,'ok');
+      markDirty();   // ยังไม่บันทึกขึ้น Firebase → เตือนให้กดบันทึก
+      toast(`Import สำเร็จ! (${imported} ชีท) — อย่าลืมกดบันทึก`,'ok');
     }catch(err){ toast('อ่านไฟล์ไม่ได้: '+err.message,'err'); }
   };
   reader.readAsArrayBuffer(file);
+}
+
+// ─── BACKUP / RESTORE (JSON — ทั้งเว็บ ทุกห้องเรียน) ───
+const BACKUP_VERSION = 1;
+function doExportJson(){
+  try{
+    if(adminOpen) collectForm();   // เก็บค่าที่กำลังแก้ก่อน เพื่อ backup ให้ตรงล่าสุด
+    const backup = {
+      _type:'krunon-classroom-backup',
+      _version:BACKUP_VERSION,
+      _exportedAt:new Date().toISOString(),
+      _profileCount:Object.keys(store.profiles||{}).length,
+      data:structuredClone(store)
+    };
+    const blob=new Blob([JSON.stringify(backup,null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;
+    a.download=`ห้องเรียนครูนนท์_สำรองข้อมูล_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1500);
+    toast('สำรองข้อมูลทั้งเว็บสำเร็จ (.json)','ok');
+  }catch(e){ toast('สำรองข้อมูลไม่สำเร็จ: '+e.message,'err'); }
+}
+async function doImportJson(e){
+  const file=e.target.files[0]; if(!file) return; e.target.value='';
+  const reader=new FileReader();
+  reader.onload=async ev=>{
+    try{
+      const parsed=JSON.parse(ev.target.result);
+      // รองรับทั้งไฟล์ที่ห่อ {_type,data} และไฟล์ store ดิบ
+      const incoming = (parsed && parsed.data && parsed.data.profiles) ? parsed.data
+                     : (parsed && parsed.profiles) ? parsed : null;
+      if(!incoming || !incoming.profiles || typeof incoming.profiles!=='object' || !Object.keys(incoming.profiles).length){
+        toast('ไฟล์สำรองไม่ถูกต้อง (ไม่พบข้อมูลห้องเรียน)','err'); return;
+      }
+      const n=Object.keys(incoming.profiles).length;
+      const when = parsed._exportedAt ? new Date(parsed._exportedAt).toLocaleString('th-TH') : 'ไม่ทราบเวลา';
+      if(!confirm(`กู้คืนข้อมูลทั้งเว็บจากไฟล์สำรอง?\n\n• ห้องเรียน: ${n} ห้อง\n• สำรองเมื่อ: ${when}\n\n⚠️ ข้อมูลปัจจุบันทั้งหมดจะถูกแทนที่และบันทึกขึ้น Firebase\n\nกด OK เพื่อกู้คืน`)) return;
+      switching=true;   // กัน snapshot มาทับระหว่างกู้คืน
+      try{
+        // สร้าง store ใหม่จากไฟล์ พร้อมเติมค่า default ที่อาจขาด
+        store.profiles=incoming.profiles;
+        store.activeProfile=(incoming.activeProfile && incoming.profiles[incoming.activeProfile])
+                            ? incoming.activeProfile : Object.keys(incoming.profiles)[0];
+        if(incoming.password!==undefined) store.password=incoming.password;
+        store.gasEndpoint=incoming.gasEndpoint||'';
+        store.driveFolderId=incoming.driveFolderId||'';
+        syncDriveCfg();
+        const ok=await persistStore();   // เขียนทั้งก้อนขึ้น Firebase
+        fillForm(); renderLinks(); renderAnns(); renderPublic(); applyTheme(); buildProfileTabs(); renderStats();
+        markClean();
+        toast(ok?`กู้คืนสำเร็จ! (${n} ห้องเรียน)`:`กู้คืนในเครื่องแล้ว แต่ซิงก์ Firebase ไม่สำเร็จ`, ok?'ok':'err');
+      } finally {
+        setTimeout(()=>{ switching=false; }, 600);
+      }
+    }catch(err){ toast('อ่านไฟล์ JSON ไม่ได้: '+err.message,'err'); }
+  };
+  reader.readAsText(file);
 }
 function doClearAll(){
   if(!confirm(`⚠️ ล้างข้อมูลห้องเรียน "${ap().name||'นี้'}"?\n\nระบบจะ Export ข้อมูลปัจจุบันให้ก่อน แล้วจึงลบลิงก์และประกาศทั้งหมด\n\nกด OK เพื่อยืนยัน`)) return;
@@ -2314,26 +2463,57 @@ function buildProfileTabs(){
     container.appendChild(btn);
   });
 }
-function switchProfile(id){
-  if(!store.profiles[id]) return;
-  collectForm(); store.activeProfile=id;
-  fillForm(); renderLinks(); renderAnns(); renderPublic(); applyTheme(); buildProfileTabs(); renderStats();
-  toast(`เปลี่ยนเป็น: ${store.profiles[id].name||id}`,'ok');
+async function switchProfile(id){
+  if(switching) return;                         // กันกดรัว/กดซ้อน
+  if(!store.profiles[id]) { toast('ไม่พบห้องเรียนนี้','err'); return; }
+  if(id===store.activeProfile){ fillForm(); renderLinks(); renderAnns(); return; }
+  if(!configLoaded){ toast('กำลังโหลดข้อมูล… ลองอีกครั้ง','err'); return; }
+  switching=true;
+  try{
+    // 1) เก็บค่าที่กำลังแก้ของห้องเดิมก่อน (กันข้อมูลที่พิมพ์ค้างหาย)
+    if(adminOpen) collectForm();
+    // 2) สลับห้อง
+    store.activeProfile=id;
+    // 3) วาดฟอร์ม/หน้าใหม่ทันที (ผู้ใช้เห็นผลทันที ไม่ต้องรอเครือข่าย)
+    fillForm(); renderLinks(); renderAnns(); renderPublic(); applyTheme(); buildProfileTabs(); renderStats();
+    toast(`เปลี่ยนเป็น: ${store.profiles[id].name||id}`,'ok');
+    // 4) บันทึกขึ้น Firebase ให้ activeProfile + ค่าที่แก้ค้างถาวร (กันข้อมูลหายหลังรีเฟรช)
+    const ok=await persistStore();
+    if(ok) markClean();
+  } finally {
+    // ปลดล็อกหลังหน่วงสั้น ๆ เพื่อให้ snapshot echo ผ่านไปก่อน
+    setTimeout(()=>{ switching=false; }, 600);
+  }
 }
-function doNewProfile(){
+async function doNewProfile(){
   const name=prompt('ชื่อห้องเรียนใหม่ (เช่น ม.4/1, ชุมนุมวรรณคดี):',''); if(!name||!name.trim()) return;
-  const id='p'+Date.now(); store.profiles[id]={ name:name.trim(), ...structuredClone(DEFAULT_PROFILE) }; switchProfile(id);
+  if(adminOpen) collectForm();                  // กันค่าห้องปัจจุบันที่แก้ค้างหาย
+  const id='p'+Date.now();
+  store.profiles[id]={ name:name.trim(), ...structuredClone(DEFAULT_PROFILE) };
+  await switchProfile(id);
 }
-function renameProfile(id,newName){ const n=(newName||'').trim(); if(!n||!store.profiles[id]) return; store.profiles[id].name=n; buildProfileTabs(); renderPublic(); }
-function deleteProfile(id){
+async function renameProfile(id,newName){
+  const n=(newName||'').trim(); if(!n||!store.profiles[id]) return;
+  if(store.profiles[id].name===n) return;
+  store.profiles[id].name=n; buildProfileTabs(); renderPublic();
+  await persistStore();                         // เซฟชื่อใหม่ทันที
+}
+async function deleteProfile(id){
   const keys=Object.keys(store.profiles);
   if(keys.length<=1){ toast('ต้องมีอย่างน้อย 1 ห้องเรียน','err'); return; }
   const name=store.profiles[id]?.name||id;
   if(!confirm(`ลบห้องเรียน "${name}" ?\n\nข้อมูลลิงก์และประกาศทั้งหมดในห้องนี้จะหายไป`)) return;
-  delete store.profiles[id];
-  if(store.activeProfile===id) store.activeProfile=Object.keys(store.profiles)[0];
-  fillForm(); renderLinks(); renderAnns(); renderPublic(); applyTheme(); buildProfileTabs(); renderStats();
-  toast(`ลบห้องเรียน "${name}" แล้ว`,'ok');
+  switching=true;
+  try{
+    delete store.profiles[id];
+    if(store.activeProfile===id) store.activeProfile=Object.keys(store.profiles)[0];
+    fillForm(); renderLinks(); renderAnns(); renderPublic(); applyTheme(); buildProfileTabs(); renderStats();
+    await persistStore();                        // เซฟการลบทันที กันห้องที่ลบกลับมา
+    markClean();
+    toast(`ลบห้องเรียน "${name}" แล้ว`,'ok');
+  } finally {
+    setTimeout(()=>{ switching=false; }, 600);
+  }
 }
 
 // ─── ดอกไม้ไทยลอยพื้นหลัง ───
@@ -2444,22 +2624,17 @@ function toast(msg,type='ok'){ const t=gi('toast'); t.textContent=msg; t.classNa
  *    ทางเลือกตามระดับความปลอดภัย — เลือกใช้ "หนึ่งชุด" เท่านั้น:
  * ============================================================ */
 
-/* ── ชุด A: ใช้งานง่าย (อ่าน/เขียน เฉพาะ doc เดียวของแอป) ──
- *  เหมาะกับการใช้งานจริงทั่วไป จำกัดให้แตะได้แค่ linktree/config
- *  (กันการสร้าง collection มั่วๆ แต่ยังเปิดเขียนสาธารณะที่ doc นี้) */
+/* ── ชุด A: ใช้งานง่าย (อ่านได้ทุกคน / เขียนได้เฉพาะ linktree) ──
+ *  เหมาะกับการใช้งานจริงทั่วไป — เว็บใช้ PIN ฝั่งหน้าเว็บคุมการแก้ไข
+ *  (ไม่มี Firebase Auth) จึงเปิดเขียนสาธารณะที่ collection linktree */
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /linktree/config {
-      allow read: if true;
-      allow write: if request.resource.data.keys().hasOnly(
-        ['password','activeProfile','gasEndpoint','driveFolderId','profiles']
-      );
-    }
-    // ปิดส่วนอื่นทั้งหมด
-    match /{document=**} {
-      allow read, write: if false;
-    }
+    // อ่านได้ทุกคน (เว็บห้องเรียนแสดงให้นักเรียน/ผู้เกี่ยวข้องดูได้)
+    match /{document=**} { allow read: if true; }
+    // เขียนได้เฉพาะเอกสารของระบบห้องเรียนครูนนท์
+    // (เว็บใช้ PIN ฝั่งหน้าเว็บคุมการแก้ไข — ไม่มี Firebase Auth)
+    match /linktree/{id} { allow write: if true; }  // ข้อมูลเว็บห้องเรียน (config)
   }
 }
 
